@@ -234,6 +234,61 @@ describe("lifecycle outbox", () => {
 });
 
 describe("contextual application", () => {
+  it.each(["approved", "rejected", "unawaited", "later gate"] as const)("checks the current decision boundary for an %s action", async state => {
+    const {visit} = await fixture();
+    await visit(async impl => {
+      seed(impl);
+      const q = await queue(impl);
+      const automatic = state === "later gate";
+      if (automatic) {
+        vi.spyOn(impl, "getGatekeeperFacet").mockResolvedValue({applyActionInContext: async () => {}} as any);
+        impl.storage.autoApproveTags.put({gatekeeperId: 7,
+          actionKind: {tag: "edit", label: "Edits"}, enabledBy: USER});
+      }
+      await q.submitAction(42, {...description, awaitDecision: state !== "unawaited",
+        autoApprovable: automatic, actionKind: {tag: "edit", label: "Edits"}});
+      const action = [...impl.storage.actions.list()][0];
+      if (state === "approved" || state === "rejected") {
+        impl.storage.actions.put({...action, state});
+      } else if (automatic) {
+        // A later manual action must not gate an earlier automatic action.
+        await q.submitAction(43, description);
+        await impl.drainAutoApprovals(7);
+      }
+      expect(impl.consumeCapturedActions(1)?.awaitDecision).toBe(state === "rejected");
+      impl.storage.activeAgents.delete(1);
+    });
+  });
+
+  it.each(["submission", "consumption"] as const)("suspends an awaited action when an uncertain predecessor is fenced before %s", async boundary => {
+    const {visit} = await fixture();
+    await visit(async impl => {
+      seed(impl);
+      const lookup = Promise.withResolvers<void>();
+      const contextual = vi.fn(async (_action: number) => { throw new Error("ACK lost after effect"); });
+      vi.spyOn(impl, "getGatekeeperFacet").mockImplementation(async () => {
+        await lookup.promise;
+        return {applyActionInContext: contextual} as any;
+      });
+      impl.storage.autoApproveTags.put({gatekeeperId: 7,
+        actionKind: {tag: "edit", label: "Edits"}, enabledBy: USER});
+      const automatic = {...description, autoApprovable: true, actionKind: {tag: "edit", label: "Edits"}};
+      const q = await queue(impl);
+      await q.submitAction(42, automatic);
+      if (boundary === "submission") {
+        lookup.resolve();
+        await impl.drainAutoApprovals(7);
+      }
+      await q.submitAction(43, {...automatic, awaitDecision: true});
+      lookup.resolve();
+      await impl.drainAutoApprovals(7);
+      expect(contextual.mock.calls.map(([action]) => action)).toEqual([42]);
+      expect([...impl.storage.actions.list()].every(record => record.state === "pending")).toBe(true);
+      expect(impl.consumeCapturedActions(1)?.awaitDecision).toBe(true);
+      impl.storage.activeAgents.delete(1);
+    });
+  });
+
   it("fences a lost ACK against coalesced and later automatic drains, but permits explicit retry", async () => {
     const {visit} = await fixture();
     await visit(async impl => {

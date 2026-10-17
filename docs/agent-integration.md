@@ -79,7 +79,9 @@ There is no fallback to legacy application after contextual dispatch, and revoca
 fails closed. Existing/ungranted actions keep legacy behavior even if a grant is later
 added. Before contextual dispatch, the action row records that an attempt has begun.
 An attempted action left pending blocks automatic drains, including coalesced drains
-and drains after reset. This conservative fence also covers a reset just before the
+and drains after reset. An awaited action behind that fence suspends the agent; this
+decision is checked when the tool finishes, not only when the action is submitted.
+This conservative fence also covers a reset just before the
 remote effect; it cannot distinguish that from a lost reply after success. Explicit
 retry remains possible after checking the outcome; receiver idempotency is still
 required. This layer does not claim exactly-once execution across an unjournalled

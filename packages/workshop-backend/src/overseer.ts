@@ -5931,20 +5931,10 @@ class OverseerImpl implements AgentHooks {
     });
     this.#associateAction(caller, actionId);
 
-    // Same auto-approval gate the drainer uses, named because awaitDecision uses it too. The drain
+    // Same auto-approval gate the drainer uses. The drain
     // is deferred because applying calls back into the gatekeeper facet still awaiting submitAction.
-    let willAutoApprove = autoApprovalRule(this.storage, gatekeeperId, description) !== undefined;
+    let willAutoApprove = autoApprovalRule(this.storage, record) !== undefined;
     if (!willAutoApprove) this.traceAgentActionApproval(record, "requested");
-
-    // Only agent turns suspend on awaitDecision, and only when a manual decision is pending: on this
-    // action, or on an earlier one the in-order drain stops at. Auto-approved actions keep the
-    // seamless behavior the user opted into.
-    if (caller.from === "agent" && description.awaitDecision && (!willAutoApprove ||
-        [...this.storage.actions.pendingByGatekeeper.get(gatekeeperId)].some(queued =>
-            queued.type === "action" &&
-            autoApprovalRule(this.storage, gatekeeperId, queued.description) === undefined))) {
-      this.#getOrCreateCapturedActions(caller.chatId).awaitDecision = true;
-    }
 
     if (willAutoApprove) {
       this.ctx.waitUntil(this.drainAutoApprovals(gatekeeperId));
@@ -9014,14 +9004,17 @@ class OverseerImpl implements AgentHooks {
       : {actions: number[], accessedGadget: boolean, awaitDecision: boolean} | undefined {
     let result = this.#capturedActions.get(chatId);
     this.#capturedActions.delete(chatId);
-    // Submission latched this, but the user may decide while the tool still runs, before the step's
-    // action cards exist for an approval to resume from. So stop only for an awaited action that is
-    // still pending, or was rejected (which ends the turn).
+    // Decide after the tool returns: an earlier action's attempt fence or a human decision may
+    // have arrived since submission. Awaited actions pause on the same manual gates as the drain,
+    // including an uncertain predecessor; already-approved actions do not pause.
     if (result) {
-      result.awaitDecision &&= result.actions.some(id => {
+      result.awaitDecision = result.actions.some(id => {
         let record = this.storage.actions.get(id);
-        return record?.type === "action" && record.description.awaitDecision &&
-            record.state !== "approved";
+        if (record?.type !== "action" || !record.description.awaitDecision || record.state === "approved") return false;
+        return record.state === "rejected" ||
+            [...this.storage.actions.pendingByGatekeeper.get(record.gatekeeperId)].some(queued =>
+                queued.type === "action" && queued.id <= record.id &&
+                autoApprovalRule(this.storage, queued) === undefined);
       });
     }
     return result;

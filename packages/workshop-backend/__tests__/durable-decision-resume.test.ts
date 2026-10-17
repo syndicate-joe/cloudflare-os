@@ -775,21 +775,29 @@ describe("decision handoff using the existing execution row", () => {
 
   it("retains the runnable execution when an entry callback fails, then retries from the alarm", async () => {
     const s = await scenario(), requests = inference();
+    const name = crypto.randomUUID();
+    const alarmEntered = Promise.withResolvers<void>(), releaseAlarm = Promise.withResolvers<void>();
+    const receiver = (impl: Impl) => {
+      const exports = impl.ctx.exports as typeof impl.ctx.exports & {
+        TestLifecycleParticipant(options: {props: {name: string}}): Fetcher<TestLifecycleParticipant>;
+      };
+      return exports.TestLifecycleParticipant({props: {name}});
+    };
     await s.visit(async impl => {
+      // Drive alarm handling explicitly, without racing wall-clock wake-ups in the assertions.
+      const setAlarm = impl.ctx.storage.setAlarm.bind(impl.ctx.storage);
+      vi.spyOn(impl.ctx.storage, "setAlarm").mockImplementation((time, options) =>
+        setAlarm(Math.max(Number(time), Date.now() + 60_000), options));
       impl.env.AGENT_INTEGRATION_GRANTS = '{"test":{"lifecycle":true}}';
       impl.storage.gatekeepers.put({id: 31, class: {} as any,
         creationSpec: {type: "ambient", vendorId: "test", accountId: 1}});
       const meta = impl.storage.chatMeta.get(CHAT)!;
       impl.storage.chatMeta.put({...meta, activeAgent: MODEL.profile});
       const origin = impl.integrations.capture(CHAT)!;
-      const exports = impl.ctx.exports as typeof impl.ctx.exports & {
-        TestLifecycleParticipant(options: {props: {name: string}}): Fetcher<TestLifecycleParticipant>;
-      };
-      const receiver = exports.TestLifecycleParticipant({props: {name: crypto.randomUUID()}});
-      await impl.integrations.context(31, origin)!.participate(receiver);
+      await impl.integrations.context(31, origin)!.participate(receiver(impl));
       await impl.integrations.drain(CHAT);
       impl.storage.chatMeta.put(meta);
-      await receiver.setFailure(true);
+      await receiver(impl).setFailure(true);
       decide(impl, "connection");
       impl.resumeAgentAfterDecision(CHAT);
       await impl.waitForAllAgentsToComplete();
@@ -797,7 +805,25 @@ describe("decision handoff using the existing execution row", () => {
       expect(impl.storage.activeAgents.get(CHAT)?.integration?.turnId).toBe(origin.turnId);
       expect(impl.storage.chatMeta.get(CHAT)?.activeAgent).toEqual(MODEL.profile);
       expect(await impl.ctx.storage.getAlarm()).not.toBeNull();
-      await receiver.setFailure(false);
+      vi.spyOn(impl, "deliverReadyExternalMessageResponses").mockImplementationOnce(async () => {
+        alarmEntered.resolve();
+        await releaseAlarm.promise;
+      });
+      // Consume the scheduled alarm as the platform does before invoking the handler.
+      await impl.ctx.storage.deleteAlarm();
+      const alarm = impl.runAlarmTasks();
+      await alarmEntered.promise;
+      try {
+        await impl.waitForAllAgentsToComplete();
+        expect(requests()).toBe(0);
+        expect(impl.storage.activeAgents.get(CHAT)).toBeDefined();
+        // The platform consumes the alarm before entering its handler. While that handler is
+        // held open, null is expected; it must re-arm the durable work when it finishes.
+        expect(await impl.ctx.storage.getAlarm()).toBeNull();
+      } finally { releaseAlarm.resolve(); await alarm; }
+      expect(await impl.ctx.storage.getAlarm()).not.toBeNull();
+      await receiver(impl).setFailure(false);
+      await impl.ctx.storage.deleteAlarm();
       await impl.runAlarmTasks();
       await impl.integrations.drain(CHAT);
       expect(requests()).toBe(1);
